@@ -9,18 +9,16 @@ from gtda.homology import VietorisRipsPersistence
 from gtda.graphs import GraphGeodesicDistance
 import networkx as nx
 from sklearn.cluster import DBSCAN
+import gudhi as gd
 
 from persim import plot_diagrams
 from gtda.plotting import plot_diagram
 
-from flooder import (
-    generate_noisy_torus_points_3d,
-    flood_complex, 
-    generate_landmarks)
+from flooder import flood_complex, generate_landmarks
 
 DEVICE = "cuda"
-NUM_LMS = 200      # Number of landmarks for Flood complex
-PERS_THRES = 0.3  # Threshold for filtering persistent features
+NUM_LMS = 200       # Number of landmarks for Flood complex
+PERS_THRES = 0.2    # Threshold for filtering persistent features
 
 
 def compute_flood_complex_ph(las):
@@ -231,9 +229,7 @@ def compute_reeb_graph_ph(las, num_intervals=10, perc_overlap=0.2, dbscan_eps=0.
     pts = las.xyz
     # Define the scalar function (lens) to project the data
     # lens = mapper.fit_transform(pts, projection="sum")  # Using sum as a simple lens
-    # lens = pts[:, 2] # Using the elevation as the lens
-    center = np.median(pts, axis=0) 
-    lens = np.linalg.norm(pts - center, axis=1)
+    lens = pts[:, 2] # Using the elevation as the lens
 
     graph = mapper.map(lens, 
                        pts, 
@@ -242,7 +238,7 @@ def compute_reeb_graph_ph(las, num_intervals=10, perc_overlap=0.2, dbscan_eps=0.
     
     """ Visualize the Reeb graph """
     las, graph_data = create_visuals_for_cloudcompare(las, graph)
-    las.write(os.path.join(os.path.dirname(__file__), "data", "dales-sample-clusters.las"))
+    las.write(os.path.join(os.path.dirname(__file__), "data", "mapper-clusters.las"))
     print("Successfully exported cluster-labeled LAS file for CloudCompare.")
 
     visualize_mapper_open3d(las, graph_data)
@@ -255,15 +251,16 @@ def compute_reeb_graph_ph(las, num_intervals=10, perc_overlap=0.2, dbscan_eps=0.
     )
     print(f"Interactive skeleton saved to {output_html}")
 
+    # Convert the Kepler Mapper graph to NetworkX
+    nx_graph = km.adapter.to_nx(graph)
+    num_nodes = len(nx_graph.nodes)
+    node_list = list(nx_graph.nodes)
+    node_to_idx = {node: idx for idx, node in enumerate(node_list)}
+    idx_to_node = {idx: node for node, idx in node_to_idx.items()}
+
     # """ 
     # Compute persistent homology (PH) over the Reeb graph's structural metric space
     # """
-    # # Convert the Kepler Mapper graph to NetworkX
-    # nx_graph = km.adapter.to_nx(graph)
-    # num_nodes = len(nx_graph.nodes)
-    # node_list = list(nx_graph.nodes)
-    # node_to_idx = {node: idx for idx, node in enumerate(node_list)}
-
     # # Create an unweighted adjacency matrix of the skeleton layout
     # adj_weighted = np.full((num_nodes, num_nodes), np.inf)
     # np.fill_diagonal(adj_weighted, 0)
@@ -296,6 +293,121 @@ def compute_reeb_graph_ph(las, num_intervals=10, perc_overlap=0.2, dbscan_eps=0.
     # fig = plot_diagram(persistence_diagrams[0])
     # fig.show()
 
+    
+    """ 
+    Compute Sublevel Set Persistent Homology (PH) over the Reeb graph's scalar function
+    """
+    # Calculate elevations
+    node_elevations = {
+        node: np.mean(pts[graph['nodes'][node], 2]) for node in node_list
+    }
+
+    # Build the clean GUDHI SimplexTree
+    stree = gd.SimplexTree()
+
+    # Insert non-isolated vertices
+    for node, idx in node_to_idx.items():
+        stree.insert([idx], filtration=node_elevations[node])
+
+    # Insert edges
+    for u, v in nx_graph.edges:
+        idx_u, idx_v = node_to_idx[u], node_to_idx[v]
+        edge_filtration = max(node_elevations[u], node_elevations[v])
+        stree.insert([idx_u, idx_v], filtration=edge_filtration)
+
+    # Compute and plot
+    stree.initialize_filtration() 
+    stree.compute_persistence()
+    ph = [stree.persistence_intervals_in_dimension(i) for i in range(3)]
+
+    # Plot persistence diagrams
+    plt.figure(figsize=(8, 8))
+    plot_diagrams(ph, labels=['$H_0$', '$H_1$', '$H_2$'])
+    plt.title("Sublevel Set Persistence")
+    plt.show()
+
+
+    # --- TOPOLOGICAL FEATURE EXTRACTION & POINT LABELING ---
+    
+    # Initialize a label array for the original point cloud points (0 = background/noise)
+    # We will give a unique integer ID to each distinct persistent cluster
+    point_labels = np.zeros(len(pts), dtype=np.int32)
+    
+    # Extract persistence pairs (shows which simplices caused births/deaths)
+    pairs = stree.persistence_pairs()
+    
+    persistent_cluster_id = 1
+    
+    for birth_simplex, death_simplex in pairs:
+        # H0 features are born at dimension 0 (0-simplex / vertex)
+        if len(birth_simplex) == 1:
+            birth_node_idx = birth_simplex[0]
+            birth_val = stree.filtration(birth_simplex)
+            
+            # Determine death filtration value
+            if death_simplex:
+                death_val = stree.filtration(death_simplex)
+            else:
+                # Essential features persist to infinity. Assign a high relative value
+                death_val = max(node_elevations.values()) + 5.0 
+                
+            persistence = death_val - birth_val
+            
+            # If the feature is highly persistent (not noise)
+            if persistence >= PERS_THRES:
+                birth_node = idx_to_node[birth_node_idx]
+                print(f"Persistent Cluster {persistent_cluster_id} detected! "
+                      f"Birth: {birth_val:.2f}, Death: {death_val:.2f}, Persistence: {persistence:.2f}")
+                
+                # --- Map the feature back to the graph's nodes ---
+                # A connected component is born at 'birth_node'. As elevation increases,
+                # we trace all nodes connected to it that were born BEFORE the death time.
+                cluster_nodes = set()
+                queue = [birth_node]
+                
+                while queue:
+                    curr_node = queue.pop(0)
+                    if curr_node not in cluster_nodes:
+                        # Only include nodes that exist within this cluster's filtration lifespan
+                        if node_elevations[curr_node] <= death_val:
+                            cluster_nodes.add(curr_node)
+                            # Traverse neighbors in the NetworkX graph
+                            for neighbor in nx_graph.neighbors(curr_node):
+                                if neighbor not in cluster_nodes and neighbor not in queue:
+                                    queue.append(neighbor)
+                
+                # --- Map the graph nodes back to the raw point indices ---
+                # Each Kepler Mapper node holds a list of original point indices in graph['nodes'][node]
+                for node in cluster_nodes:
+                    point_indices = graph['nodes'][node]
+                    point_labels[point_indices] = persistent_cluster_id
+                
+                persistent_cluster_id += 1
+
+    # --- SAVE THE ORIGINAL POINT CLOUD WITH CLUSTER LABELS ---
+    # Create a new extra dimension in the LAS file for CloudCompare
+    labeled_las = laspy.LasData(las.header)
+    labeled_las.xyz = las.xyz
+    
+    # If the file had other dimensions, copy them over
+    for name in las.point_format.dimension_names:
+        if name not in ['X', 'Y', 'Z']:
+            labeled_las[name] = las[name]
+
+    # Add the custom persistent cluster ID dimension
+    labeled_las.add_extra_dim(laspy.ExtraBytesParams(
+        name="persistent_cluster", 
+        type=np.int32, 
+        description="H0 pers. clusters"
+    ))
+    labeled_las["persistent_cluster"] = point_labels
+
+    # Save to file
+    output_path = os.path.join(os.path.dirname(__file__), "data", "persistent-clusters.las")
+    labeled_las.write(output_path)
+    print(f"Saved {persistent_cluster_id - 1} persistent clusters to {output_path} for CloudCompare!")
+
+
 
 if __name__ == "__main__":
     input_file = os.path.join(os.path.dirname(__file__), "data", "dales-sample.las")
@@ -306,6 +418,6 @@ if __name__ == "__main__":
     # compute_flood_complex_ph(las)
 
     # Compute the Mapper-based Reeb graph and its persistence diagrams
-    compute_reeb_graph_ph(las, num_intervals=20, perc_overlap=0.2, dbscan_eps=1, dbscan_min_samples=5)
+    compute_reeb_graph_ph(las, num_intervals=20, perc_overlap=0.2, dbscan_eps=0.4, dbscan_min_samples=5)
 
 
