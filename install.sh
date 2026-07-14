@@ -2,7 +2,7 @@
 
 # Local variables
 PROJECT_NAME=tda
-PYTHON=3.9
+PYTHON=3.8
 
 # Recover the project's directory from the position of the install.sh
 # script and move there. Not doing so would install some dependencies in
@@ -73,7 +73,11 @@ conda install pip nb_conda_kernels -y
 pip install flooder
 pip install persim
 pip install laspy
+pip install open3d
 pip install torch --index-url https://download.pytorch.org/whl/${CUDA_MAJOR}${CUDA_MINOR}
+conda install scikit-learn -y
+pip install kmapper
+pip install giotto-tda
 
 # let user know
 echo
