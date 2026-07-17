@@ -10,6 +10,7 @@ from gtda.graphs import GraphGeodesicDistance
 import networkx as nx
 from sklearn.cluster import DBSCAN
 import gudhi as gd
+from scipy.spatial.distance import cdist
 
 from persim import plot_diagrams
 from gtda.plotting import plot_diagram
@@ -257,6 +258,29 @@ def visualize_mapper_open3d(las, graph_data):
     gui.Application.instance.run()
 
 
+def get_eccentricity_lens(pts, method="exact", batch_size=1000):
+    """
+    Computes the eccentricity lens for a point cloud.
+    'exact': Calculates L-infinity eccentricity using batched pairwise distances.
+    'approx': Calculates distance to the barycenter (centroid) - fast for huge clouds.
+    """
+    if method == "approx":
+        # Distance of each point to the centroid of the cloud
+        centroid = np.mean(pts, axis=0)
+        return np.linalg.norm(pts - centroid, axis=1)
+        
+    elif method == "exact":
+        # Memory-efficient batched exact L-infinity eccentricity
+        num_pts = len(pts)
+        ecc = np.zeros(num_pts)
+        for i in range(0, num_pts, batch_size):
+            end_idx = min(i + batch_size, num_pts)
+            # Distance from batch to all points
+            dists = cdist(pts[i:end_idx], pts)
+            ecc[i:end_idx] = np.max(dists, axis=1)
+        return ecc
+    
+
 def compute_reeb_graph_ph(las, num_intervals=10, perc_overlap=0.2, dbscan_eps=0.5, dbscan_min_samples=5):
     """
     Computes the persistent homology (PH) of the Reeb graph from the given point cloud 
@@ -267,7 +291,8 @@ def compute_reeb_graph_ph(las, num_intervals=10, perc_overlap=0.2, dbscan_eps=0.
     pts = las.xyz
     # Define the scalar function (lens) to project the data
     # lens = mapper.fit_transform(pts, projection="sum")  # Using sum as a simple lens
-    lens = pts[:, 2] # Using the elevation as the lens
+    # lens = pts[:, 2] # Using the elevation as the lens
+    lens = get_eccentricity_lens(pts, method="approx")
 
     graph = mapper.map(lens, 
                        pts, 
