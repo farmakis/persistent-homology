@@ -18,7 +18,7 @@ from flooder import flood_complex, generate_landmarks
 
 DEVICE = "cuda"
 NUM_LMS = 200       # Number of landmarks for Flood complex
-PERS_THRES = 0.2    # Threshold for filtering persistent features
+PERS_THRES = 0.3    # Threshold for filtering persistent features
 
 
 def compute_flood_complex_ph(las):
@@ -195,7 +195,7 @@ def visualize_mapper_open3d(las, graph_data):
         idx_source = node_id_to_idx[edge["source"]]
         idx_target = node_id_to_idx[edge["target"]]
         lines.append([idx_source, idx_target])
-        line_colors.append(node_colors[edge["source"]])
+        line_colors.append([0.0, 0.0, 0.0])
 
     line_set = o3d.geometry.LineSet()
     line_set.points = o3d.utility.Vector3dVector(node_positions)
@@ -205,18 +205,56 @@ def visualize_mapper_open3d(las, graph_data):
     # --- 4. Render Nodes as Spheres ---
     graph_geometries = [line_set]
     for node in graph_data["nodes"]:
-        sphere = o3d.geometry.TriangleMesh.create_sphere(radius=0.4)  # Adjust based on your cloud scale
+        sphere = o3d.geometry.TriangleMesh.create_sphere(radius=0.4)
         sphere.compute_vertex_normals()
         sphere.paint_uniform_color(node_colors[node["id"]])
         sphere.translate([node["x"], node["y"], node["z"]])
         graph_geometries.append(sphere)
 
     print(f"Launching Open3D visualization window ({len(filtered_pts)} clustered points remaining)...")
-    o3d.visualization.draw_geometries([pcd] + graph_geometries, 
-                                      window_name="Mapper Reeb Graph - Clustered Points Only",
-                                      width=1280, height=720,
-                                      left=50, top=50,
-                                      mesh_show_back_face=True)
+    
+    # ----------------------------------------------------
+    # Modern Visualizer implementation for Thicker Lines
+    # ----------------------------------------------------
+    gui = o3d.visualization.gui
+    rendering = o3d.visualization.rendering
+
+    # Initialize the GUI application
+    gui.Application.instance.initialize()
+    
+    # Create the window
+    window = gui.Application.instance.create_window(
+        "Mapper Reeb Graph - Clustered Points Only", 
+        width=1280, height=720
+    )
+    
+    # Create the 3D widget
+    widget = o3d.visualization.gui.SceneWidget()
+    widget.scene = rendering.Open3DScene(window.renderer)
+    window.add_child(widget)
+
+    # Set up the line material with a custom line width
+    line_material = rendering.MaterialRecord()
+    line_material.shader = "unlitLine"
+    line_material.line_width = 3.0  # <--- ADJUST THIS FOR THICKNESS (in pixels)
+
+    # Standard material for points and spheres
+    default_material = rendering.MaterialRecord()
+    default_material.shader = "defaultLit"
+
+    # Add geometries to the scene
+    widget.scene.add_geometry("Point Cloud", pcd, default_material)
+    widget.scene.add_geometry("Line Set", line_set, line_material)
+    
+    for i, sphere in enumerate(graph_geometries[1:]):  # Skip line_set at index 0
+        widget.scene.add_geometry(f"Sphere_{i}", sphere, default_material)
+
+    # Setup camera view
+    bounds = pcd.get_axis_aligned_bounding_box()
+    widget.setup_camera(60, bounds, bounds.get_center())
+
+    # Run the application
+    gui.Application.instance.run()
 
 
 def compute_reeb_graph_ph(las, num_intervals=10, perc_overlap=0.2, dbscan_eps=0.5, dbscan_min_samples=5):
@@ -418,6 +456,6 @@ if __name__ == "__main__":
     # compute_flood_complex_ph(las)
 
     # Compute the Mapper-based Reeb graph and its persistence diagrams
-    compute_reeb_graph_ph(las, num_intervals=20, perc_overlap=0.2, dbscan_eps=0.4, dbscan_min_samples=5)
+    compute_reeb_graph_ph(las, num_intervals=20, perc_overlap=0.2, dbscan_eps=1, dbscan_min_samples=5)
 
 
